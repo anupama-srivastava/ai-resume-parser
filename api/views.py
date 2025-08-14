@@ -4,6 +4,15 @@ from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.shortcuts import get_object_or_404
 from django.contrib.auth.models import User
+from django.db.models import Count, Avg, Q
+from django.utils import timezone
+from datetime import datetime, timedelta
+from django.http import HttpResponse
+import csv
+import io
+import pandas as pd
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
 from .models import Resume, ParsedResume, JobDescription, MatchResult
 from .serializers import (
     ResumeSerializer, ResumeUploadSerializer, ParsedResumeSerializer,
@@ -91,6 +100,308 @@ class ResumeViewSet(viewsets.ModelViewSet):
         resumes = self.get_queryset()
         serializer = self.get_serializer(resumes, many=True)
         return Response(serializer.data)
+
+    @action(detail=False, methods=['get'])
+    def dashboard_stats(self, request):
+        """Get enhanced dashboard statistics."""
+        user = request.user
+        
+        # Basic stats
+        total_resumes = Resume.objects.filter(user=user).count()
+        total_jobs = JobDescription.objects.filter(user=user).count()
+        total_matches = MatchResult.objects.filter(
+            Q(resume__user=user) | Q(job_description__user=user)
+        ).count()
+        
+        # Processing stats
+        processing_stats = Resume.objects.filter(user=user).aggregate(
+            completed=Count('id', filter=Q(processing_status='completed')),
+            pending=Count('id', filter=Q(processing_status='pending')),
+            failed=Count('id', filter=Q(processing_status='failed')),
+        )
+        
+        success_rate = 0
+        if total_resumes > 0:
+            success_rate = round((processing_stats['completed'] / total_resumes) * 100)
+        
+        # Recent activity (last 30 days)
+        thirty_days_ago = timezone.now() - timedelta(days=30)
+        
+        recent_resumes = Resume.objects.filter(
+            user=user,
+            created_at__gte=thirty_days_ago
+        ).extra(
+            select={'date': 'date(created_at)'}
+        ).values('date').annotate(
+            count=Count('id')
+        ).order_by('date')
+        
+        recent_jobs = JobDescription.objects.filter(
+            user=user,
+            created_at__gte=thirty_days_ago
+        ).extra(
+            select={'date': 'date(created_at)'}
+        ).values('date').annotate(
+            count=Count('id')
+        ).order_by('date')
+        
+        # Skills analysis
+        skills_data = []
+        parsed_resumes = ParsedResume.objects.filter(resume__user=user)
+        for parsed in parsed_resumes:
+            if parsed.skills:
+                skills_data.extend(parsed.skills.get('technical', []))
+        
+        top_skills = {}
+        for skill in skills_data:
+            top_skills[skill] = top_skills.get(skill, 0) + 1
+        
+        top_skills_list = [
+            {'skill': skill, 'count': count}
+            for skill, count in sorted(top_skills.items(), key=lambda x: x[1], reverse=True)[:10]
+        ]
+        
+        # File type distribution
+        file_types = Resume.objects.filter(user=user).values(
+            'original_filename'
+        ).annotate(
+            count=Count('id')
+        )
+        
+        file_type_stats = {}
+        for ft in file_types:
+            ext = ft['original_filename'].split('.')[-1].upper()
+            file_type_stats[ext] = file_type_stats.get(ext, 0) + ft['count']
+        
+        return Response({
+            'total_resumes': total_resumes,
+            'total_jobs': total_jobs,
+            'total_matches': total_matches,
+            'success_rate': success_rate,
+            'processing_stats': processing_stats,
+            'recent_activity': {
+                'resumes': list(recent_resumes),
+                'jobs': list(recent_jobs),
+            },
+            'top_skills': top_skills_list,
+            'file_types': [
+                {'type': k, 'count': v}
+                for k, v in file_type_stats.items()
+            ],
+        })
+
+    @action(detail=False, methods=['get'])
+    def search(self, request):
+        """Advanced search across resumes."""
+        user = request.user
+        query = request.GET.get('q', '')
+        status_filter = request.GET.get('status', '')
+        date_from = request.GET.get('date_from', '')
+        date_to = request.GET.get('date_to', '')
+        file_type = request.GET.get('file_type', '')
+        
+        resumes = Resume.objects.filter(user=user)
+        
+        if query:
+            resumes = resumes.filter(
+                Q(original_filename__icontains=query) |
+                Q(extracted_text__icontains=query) |
+                Q(parsed_data__icontains=query)
+            )
+        
+        if status_filter:
+            resumes = resumes.filter(processing_status=status_filter)
+        
+        if date_from:
+            try:
+                date_from = datetime.strptime(date_from, '%Y-%m-%d')
+                resumes = resumes.filter(created_at__gte=date_from)
+            except ValueError:
+                pass
+        
+        if date_to:
+            try:
+                date_to = datetime.strptime(date_to, '%Y-%m-%d')
+                resumes = resumes.filter(created_at__lte=date_to)
+            except ValueError:
+                pass
+        
+        if file_type:
+            resumes = resumes.filter(original_filename__endswith=file_type)
+        
+        serializer = self.get_serializer(resumes.order_by('-created_at'), many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['post'])
+    def bulk_upload(self, request):
+        """Upload multiple resumes at once."""
+        files = request.FILES.getlist('files')
+        uploaded_resumes = []
+        
+        for file in files:
+            try:
+                resume = Resume.objects.create(
+                    user=request.user,
+                    file=file,
+                    original_filename=file.name,
+                    file_size=file.size
+                )
+                uploaded_resumes.append(ResumeSerializer(resume).data)
+            except Exception as e:
+                continue
+        
+        return Response({
+            'message': f'Uploaded {len(uploaded_resumes)} resumes',
+            'resumes': uploaded_resumes
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['post'])
+    def bulk_parse(self, request):
+        """Parse multiple resumes at once."""
+        resume_ids = request.data.get('resume_ids', [])
+        parsed_count = 0
+        
+        for resume_id in resume_ids:
+            try:
+                resume = Resume.objects.get(id=resume_id, user=request.user)
+                if resume.processing_status == 'pending':
+                    # Trigger async parsing
+                    parse_resume_task.delay(resume.id)
+                    parsed_count += 1
+            except Resume.DoesNotExist:
+                continue
+        
+        return Response({
+            'message': f'Started parsing {parsed_count} resumes',
+            'count': parsed_count
+        })
+
+    @action(detail=False, methods=['delete'])
+    def bulk_delete(self, request):
+        """Delete multiple resumes at once."""
+        resume_ids = request.data.get('resume_ids', [])
+        deleted_count = Resume.objects.filter(
+            id__in=resume_ids,
+            user=request.user
+        ).delete()[0]
+        
+        return Response({
+            'message': f'Deleted {deleted_count} resumes',
+            'count': deleted_count
+        })
+
+    @action(detail=False, methods=['get'])
+    def export(self, request):
+        """Export resumes data in various formats."""
+        format_type = request.GET.get('format', 'csv')
+        resume_ids = request.GET.get('ids', '').split(',') if request.GET.get('ids') else None
+        
+        resumes = Resume.objects.filter(user=request.user)
+        if resume_ids and resume_ids[0]:
+            resumes = resumes.filter(id__in=resume_ids)
+        
+        if format_type == 'csv':
+            return self.export_csv(resumes)
+        elif format_type == 'excel':
+            return self.export_excel(resumes)
+        elif format_type == 'pdf':
+            return self.export_pdf(resumes)
+        else:
+            return Response({'error': 'Invalid format'}, status=status.HTTP_400_BAD_REQUEST)
+
+    def export_csv(self, resumes):
+        """Export resumes as CSV."""
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Write headers
+        writer.writerow([
+            'Filename', 'Upload Date', 'Status', 'File Size (MB)',
+            'Parsed Skills', 'Work Experience Count'
+        ])
+        
+        # Write data
+        for resume in resumes:
+            parsed_resume = resume.parsedresume if hasattr(resume, 'parsedresume') else None
+            skills = ', '.join(parsed_resume.skills.get('technical', [])) if parsed_resume else ''
+            experience_count = len(parsed_resume.work_experience) if parsed_resume else 0
+            
+            writer.writerow([
+                resume.original_filename,
+                resume.created_at.strftime('%Y-%m-%d %H:%M'),
+                resume.processing_status,
+                round(resume.file_size / 1024 / 1024, 2),
+                skills,
+                experience_count
+            ])
+        
+        output.seek(0)
+        response = HttpResponse(output.getvalue(), content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="resumes_export.csv"'
+        return response
+
+    def export_excel(self, resumes):
+        """Export resumes as Excel."""
+        data = []
+        for resume in resumes:
+            parsed_resume = resume.parsedresume if hasattr(resume, 'parsedresume') else None
+            skills = ', '.join(parsed_resume.skills.get('technical', [])) if parsed_resume else ''
+            experience_count = len(parsed_resume.work_experience) if parsed_resume else 0
+            
+            data.append({
+                'Filename': resume.original_filename,
+                'Upload Date': resume.created_at,
+                'Status': resume.processing_status,
+                'File Size (MB)': round(resume.file_size / 1024 / 1024, 2),
+                'Skills': skills,
+                'Experience Count': experience_count
+            })
+        
+        df = pd.DataFrame(data)
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Resumes')
+        
+        output.seek(0)
+        response = HttpResponse(
+            output.getvalue(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        response['Content-Disposition'] = 'attachment; filename="resumes_export.xlsx"'
+        return response
+
+    def export_pdf(self, resumes):
+        """Export resumes as PDF."""
+        response = HttpResponse(content_type='application/pdf')
+        response['Content-Disposition'] = 'attachment; filename="resumes_export.pdf"'
+        
+        p = canvas.Canvas(response, pagesize=letter)
+        width, height = letter
+        
+        y_position = height - 50
+        p.setFont("Helvetica-Bold", 16)
+        p.drawString(50, y_position, "Resume Export Report")
+        y_position -= 30
+        
+        for resume in resumes:
+            if y_position < 100:
+                p.showPage()
+                y_position = height - 50
+            
+            p.setFont("Helvetica-Bold", 12)
+            p.drawString(50, y_position, f"File: {resume.original_filename}")
+            y_position -= 20
+            
+            p.setFont("Helvetica", 10)
+            p.drawString(50, y_position, f"Upload Date: {resume.created_at.strftime('%Y-%m-%d %H:%M')}")
+            y_position -= 15
+            p.drawString(50, y_position, f"Status: {resume.processing_status}")
+            y_position -= 15
+            p.drawString(50, y_position, f"File Size: {round(resume.file_size / 1024 / 1024, 2)} MB")
+            y_position -= 30
+        
+        p.save()
+        return response
 
 class JobDescriptionViewSet(viewsets.ModelViewSet):
     """
